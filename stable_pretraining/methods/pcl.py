@@ -276,6 +276,22 @@ class PCLOutput(ModelOutput):
     prototype_loss: Optional[torch.Tensor] = None
 
 
+class PCLClusteringState(nn.Module):
+    """Store one clustering resolution as non-trainable buffers."""
+
+    def __init__(
+        self,
+        assignments: torch.Tensor,
+        prototypes: torch.Tensor,
+        concentrations: torch.Tensor,
+    ):
+        super().__init__()
+
+        self.register_buffer("assignments", assignments.detach().clone())
+        self.register_buffer("prototypes", prototypes.detach().clone())
+        self.register_buffer("concentrations", concentrations.detach().clone())
+
+
 class PCL(Module):
     """PCL model: initial instance-contrastive warm-up implementation.
 
@@ -362,6 +378,7 @@ class PCL(Module):
         )
 
         self.num_proto_negatives = 2
+        self.additional_clusterings = nn.ModuleList()
 
     @torch.no_grad()
     def set_clustering(
@@ -405,6 +422,167 @@ class PCL(Module):
         self.cluster_assignments = assignments.detach().to(device=device).clone()
         self.cluster_prototypes = prototypes.detach().to(device=device).clone()
         self.cluster_concentrations = concentrations.detach().to(device=device).clone()
+
+        self.additional_clusterings = nn.ModuleList()
+
+    @torch.no_grad()
+    def set_clusterings(
+        self,
+        clusterings: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Store multiple clustering resolutions.
+
+        Each element contains:
+            assignments: [N]
+            prototypes: [K, D]
+            concentrations: [K]
+        """
+        if not clusterings:
+            raise ValueError("At least one clustering is required")
+
+        num_samples = clusterings[0][0].numel()
+        output_dim = self.cluster_prototypes.shape[1]
+        device = self.cluster_prototypes.device
+
+        # Validate every resolution before modifying model state.
+        for assignments, prototypes, concentrations in clusterings:
+            if assignments.ndim != 1 or assignments.dtype != torch.long:
+                raise ValueError("Invalid clustering assignments")
+
+            if assignments.numel() != num_samples or num_samples == 0:
+                raise ValueError("All clusterings must have the same N")
+
+            if prototypes.ndim != 2 or prototypes.shape[1] != output_dim:
+                raise ValueError("Invalid prototype dimensions")
+
+            k = prototypes.shape[0]
+            if k == 0 or concentrations.shape != (k,):
+                raise ValueError("Invalid concentration dimensions")
+
+            if not torch.all((assignments >= 0) & (assignments < k)).item():
+                raise ValueError("Cluster assignment out of range")
+
+            if not torch.isfinite(prototypes).all().item():
+                raise ValueError("Prototypes must be finite")
+
+            if not torch.isfinite(concentrations).all().item():
+                raise ValueError("Concentrations must be finite")
+
+            if not torch.all(concentrations > 0).item():
+                raise ValueError("Concentrations must be positive")
+
+        prepared = [
+            (
+                assignments.to(device=device, dtype=torch.long),
+                prototypes.to(device=device),
+                concentrations.to(device=device),
+            )
+            for assignments, prototypes, concentrations in clusterings
+        ]
+
+        first = prepared[0]
+        extra_states = nn.ModuleList(
+            PCLClusteringState(*state) for state in prepared[1:]
+        )
+
+        # The first resolution preserves the existing interface.
+        self.set_clustering(*first)
+
+        # Additional resolutions.
+        self.additional_clusterings = extra_states
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Restore dynamically sized clustering buffers before loading."""
+        names = (
+            "cluster_assignments",
+            "cluster_prototypes",
+            "cluster_concentrations",
+        )
+
+        # Resize primary clustering buffers to the checkpoint shapes.
+        for name in names:
+            key = prefix + name
+            if key in state_dict:
+                saved = state_dict[key]
+                current = getattr(self, name)
+
+                if current.shape != saved.shape:
+                    setattr(
+                        self,
+                        name,
+                        torch.empty(
+                            saved.shape,
+                            dtype=current.dtype,
+                            device=current.device,
+                        ),
+                    )
+
+        # Reconstruct additional clustering modules.
+        base = prefix + "additional_clusterings."
+        level_ids = set()
+
+        for key in state_dict:
+            if key.startswith(base):
+                suffix = key[len(base) :]
+                parts = suffix.split(".")
+
+                if len(parts) == 2 and parts[0].isdigit():
+                    level_ids.add(int(parts[0]))
+
+        if level_ids:
+            expected = set(range(max(level_ids) + 1))
+            if level_ids != expected:
+                error_msgs.append("Non-contiguous additional clustering indices")
+            else:
+                device = self.cluster_prototypes.device
+
+                states = []
+                for level in sorted(level_ids):
+                    level_prefix = f"{base}{level}."
+
+                    keys = [
+                        level_prefix + "assignments",
+                        level_prefix + "prototypes",
+                        level_prefix + "concentrations",
+                    ]
+
+                    if not all(key in state_dict for key in keys):
+                        error_msgs.append(
+                            f"Incomplete clustering state at level {level}"
+                        )
+                        continue
+
+                    states.append(
+                        PCLClusteringState(
+                            state_dict[keys[0]].to(device),
+                            state_dict[keys[1]].to(device),
+                            state_dict[keys[2]].to(device),
+                        )
+                    )
+
+                if len(states) == len(level_ids):
+                    self.additional_clusterings = nn.ModuleList(states)
+        else:
+            self.additional_clusterings = nn.ModuleList()
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _forward_views(
         self,
@@ -484,23 +662,48 @@ class PCL(Module):
             ).item():
                 raise ValueError("Dataset index out of range")
 
-            batch_assignments = self.cluster_assignments[indices]
+            # First clustering resolution plus any additional levels.
+            clusterings = [
+                (
+                    self.cluster_assignments,
+                    self.cluster_prototypes,
+                    self.cluster_concentrations,
+                )
+            ]
 
-            pos, neg, pos_phi, neg_phi = select_prototypes(
-                prototypes=self.cluster_prototypes,
-                assignments=batch_assignments,
-                concentrations=self.cluster_concentrations,
-                num_negatives=self.num_proto_negatives,
-            )
+            for state in self.additional_clusterings:
+                clusterings.append(
+                    (
+                        state.assignments,
+                        state.prototypes,
+                        state.concentrations,
+                    )
+                )
 
-            prototype_loss = self.prototype_loss_fn(
-                queries=q,
-                positive_prototypes=pos.to(q.dtype),
-                negative_prototypes=neg.to(q.dtype),
-                positive_concentrations=pos_phi.to(q.dtype),
-                negative_concentrations=neg_phi.to(q.dtype),
-            )
+            losses = []
 
+            for assignments, prototypes, concentrations in clusterings:
+                batch_assignments = assignments[indices]
+
+                pos, neg, pos_phi, neg_phi = select_prototypes(
+                    prototypes=prototypes,
+                    assignments=batch_assignments,
+                    concentrations=concentrations,
+                    num_negatives=self.num_proto_negatives,
+                )
+
+                level_loss = self.prototype_loss_fn(
+                    queries=q,
+                    positive_prototypes=pos.to(q.dtype),
+                    negative_prototypes=neg.to(q.dtype),
+                    positive_concentrations=pos_phi.to(q.dtype),
+                    negative_concentrations=neg_phi.to(q.dtype),
+                )
+
+                losses.append(level_loss)
+
+            # Average ProtoNCE across clustering resolutions.
+            prototype_loss = torch.stack(losses).mean()
             total_loss = instance_loss + prototype_loss
 
         # Current keys become negatives for future batches.
@@ -557,7 +760,7 @@ class PCLClusteringCallback(Callback):
     def __init__(
         self,
         dataloader: DataLoader,
-        num_clusters: int,
+        num_clusters: Union[int, Sequence[int]],
         warmup_epochs: int = 1,
         refresh_every: int = 1,
         num_iterations: int = 20,
@@ -569,9 +772,23 @@ class PCLClusteringCallback(Callback):
             raise ValueError("warmup_epochs must be nonnegative")
         if refresh_every < 1:
             raise ValueError("refresh_every must be positive")
+        if num_iterations < 1:
+            raise ValueError("num_iterations must be positive")
+
+        # Support both a single K and multiple clustering resolutions.
+        if isinstance(num_clusters, int):
+            cluster_counts = (num_clusters,)
+        else:
+            cluster_counts = tuple(num_clusters)
+
+        if not cluster_counts:
+            raise ValueError("At least one cluster count is required")
+
+        if any(not isinstance(k, int) or k < 2 for k in cluster_counts):
+            raise ValueError("Cluster counts must be integers >= 2")
 
         self.dataloader = dataloader
-        self.num_clusters = num_clusters
+        self.cluster_counts = cluster_counts
         self.warmup_epochs = warmup_epochs
         self.refresh_every = refresh_every
         self.num_iterations = num_iterations
@@ -591,21 +808,24 @@ class PCLClusteringCallback(Callback):
                 "Distributed PCL clustering refresh is not yet supported"
             )
 
+        # Extract momentum-encoder features only once per refresh.
         features = extract_clustering_features(
             pl_module,
             self.dataloader,
         )
 
-        assignments, prototypes, concentrations = kmeans(
-            features,
-            num_clusters=self.num_clusters,
-            num_iterations=self.num_iterations,
-            seed=self.seed + epoch,
-            temperature=pl_module.temperature,
-        )
+        clusterings = []
 
-        pl_module.set_clustering(
-            assignments,
-            prototypes,
-            concentrations,
-        )
+        for level, num_clusters in enumerate(self.cluster_counts):
+            assignments, prototypes, concentrations = kmeans(
+                features,
+                num_clusters=num_clusters,
+                num_iterations=self.num_iterations,
+                seed=self.seed + epoch + level,
+                temperature=pl_module.temperature,
+            )
+
+            clusterings.append((assignments, prototypes, concentrations))
+
+        # Replace all clustering resolutions together.
+        pl_module.set_clusterings(clusterings)

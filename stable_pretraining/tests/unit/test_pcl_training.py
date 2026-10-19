@@ -268,7 +268,7 @@ def test_pcl_warmup_to_prototype_training(tmp_path):
 
     clustering_callback = PCLClusteringCallback(
         dataloader=clustering_loader,
-        num_clusters=8,
+        num_clusters=(8, 10),
         warmup_epochs=1,
         refresh_every=1,
         seed=7,
@@ -327,3 +327,170 @@ def test_pcl_warmup_to_prototype_training(tmp_path):
             rel=1e-5,
             abs=1e-6,
         )
+    assert len(model.additional_clusterings) == 1
+
+    second = model.additional_clusterings[0]
+
+    assert second.assignments.shape == (16,)
+    assert second.prototypes.shape == (10, 8)
+    assert second.concentrations.shape == (10,)
+
+    assert torch.isfinite(second.concentrations).all()
+    assert (second.concentrations > 0).all()
+
+
+@pytest.mark.unit
+def test_pcl_multiresolution_clustering_callback():
+    """Refresh multiple clustering resolutions after warm-up."""
+    torch.manual_seed(7)
+
+    model = PCL(
+        encoder_name=TinyEncoder(),
+        projector_dims=(32, 8),
+        queue_length=16,
+    )
+
+    loader = DataLoader(
+        TinyDataset(),
+        batch_size=4,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    callback = PCLClusteringCallback(
+        dataloader=loader,
+        num_clusters=(3, 5),
+        warmup_epochs=1,
+        seed=7,
+    )
+
+    trainer = SimpleNamespace(
+        current_epoch=0,
+        world_size=1,
+    )
+
+    # Warm-up: no clustering should exist.
+    callback.on_train_epoch_start(trainer, model)
+    assert model.cluster_assignments.numel() == 0
+
+    # First clustering refresh.
+    trainer.current_epoch = 1
+    callback.on_train_epoch_start(trainer, model)
+
+    assert model.cluster_prototypes.shape == (3, 8)
+    assert len(model.additional_clusterings) == 1
+
+    second = model.additional_clusterings[0]
+    assert second.prototypes.shape == (5, 8)
+
+    for concentrations in (
+        model.cluster_concentrations,
+        second.concentrations,
+    ):
+        assert torch.isfinite(concentrations).all()
+        assert (concentrations > 0).all()
+        torch.testing.assert_close(
+            concentrations.mean(),
+            torch.tensor(0.2),
+        )
+
+
+@pytest.mark.unit
+def test_pcl_lightning_checkpoint_resume(tmp_path):
+    """Restore PCL clustering, queue, EMA, and optimizer state."""
+    torch.manual_seed(7)
+
+    dataset = TinyDataset()
+    train_loader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=0)
+    cluster_loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=0)
+
+    def make_pcl():
+        model = PCL(
+            encoder_name=TinyEncoder(),
+            projector_dims=(32, 8),
+            queue_length=16,
+            temperature=0.2,
+        )
+        model.num_proto_negatives = 1
+        model.optim = {"optimizer": {"type": "AdamW", "lr": 0.001}}
+        return model
+
+    def make_callbacks():
+        return [
+            TeacherStudentCallback(verbose=False),
+            PCLClusteringCallback(
+                dataloader=cluster_loader,
+                num_clusters=(8, 10),
+                warmup_epochs=1,
+                refresh_every=10,
+                seed=7,
+            ),
+        ]
+
+    def make_trainer(epochs):
+        return pl.Trainer(
+            max_epochs=epochs,
+            accelerator="cpu",
+            devices=1,
+            logger=False,
+            enable_checkpointing=False,
+            enable_progress_bar=False,
+            enable_model_summary=False,
+            callbacks=make_callbacks(),
+            default_root_dir=tmp_path,
+        )
+
+    # Phase 1: Warm-up and one prototype-training epoch.
+    model = make_pcl()
+    trainer = make_trainer(2)
+    trainer.fit(model, train_dataloaders=train_loader)
+
+    assert trainer.global_step == 16
+    assert len(model.additional_clusterings) == 1
+
+    path = tmp_path / "pcl_resume.ckpt"
+    trainer.save_checkpoint(path)
+
+    saved = torch.load(path, weights_only=False)
+
+    assert saved["global_step"] == 16
+    assert saved["optimizer_states"]
+    assert saved["optimizer_states"][0]["state"]
+
+    # Phase 2: Resume into a fresh PCL model.
+    restored = make_pcl()
+    resumed_trainer = make_trainer(3)
+
+    resumed_trainer.fit(
+        restored,
+        train_dataloaders=train_loader,
+        ckpt_path=path,
+        weights_only=False,
+    )
+
+    assert resumed_trainer.global_step == 24
+    assert len(restored.additional_clusterings) == 1
+
+    # No refresh occurs in epoch 2 (refresh_every=10),
+    # so clustering buffers should match the checkpoint.
+    for name in (
+        "cluster_assignments",
+        "cluster_prototypes",
+        "cluster_concentrations",
+    ):
+        torch.testing.assert_close(
+            getattr(restored, name),
+            saved["state_dict"][name],
+        )
+
+    second = restored.additional_clusterings[0]
+    torch.testing.assert_close(
+        second.assignments,
+        saved["state_dict"]["additional_clusterings.0.assignments"],
+    )
+    torch.testing.assert_close(
+        second.prototypes,
+        saved["state_dict"]["additional_clusterings.0.prototypes"],
+    )
+
+    assert torch.isfinite(restored.cluster_concentrations).all()

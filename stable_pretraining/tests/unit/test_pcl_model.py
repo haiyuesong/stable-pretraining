@@ -237,3 +237,182 @@ def test_pcl_dictionary_training_interface():
         p.grad is not None and p.grad.abs().sum() > 0
         for p in model.backbone.student.parameters()
     )
+
+
+@pytest.mark.unit
+def test_pcl_stores_multiple_clusterings():
+    model = make_model()
+
+    assignments1 = torch.tensor([0, 1, 2, 3])
+    prototypes1 = torch.nn.functional.normalize(torch.randn(4, 8), dim=-1)
+    phi1 = torch.full((4,), 0.2)
+
+    assignments2 = torch.tensor([0, 1, 2, 3])
+    prototypes2 = torch.nn.functional.normalize(torch.randn(6, 8), dim=-1)
+    phi2 = torch.full((6,), 0.3)
+
+    model.set_clusterings(
+        [
+            (assignments1, prototypes1, phi1),
+            (assignments2, prototypes2, phi2),
+        ]
+    )
+
+    torch.testing.assert_close(model.cluster_assignments, assignments1)
+    assert len(model.additional_clusterings) == 1
+
+    second = model.additional_clusterings[0]
+
+    torch.testing.assert_close(second.assignments, assignments2)
+    torch.testing.assert_close(second.prototypes, prototypes2)
+    torch.testing.assert_close(second.concentrations, phi2)
+
+
+@pytest.mark.unit
+def test_pcl_multiresolution_loss_average():
+    torch.manual_seed(7)
+
+    model = make_model()
+    model.num_proto_negatives = 1
+    model.train()
+
+    model.queue.append(torch.nn.functional.normalize(torch.randn(8, 8), dim=-1))
+
+    assignments1 = torch.tensor([0, 1, 2, 3])
+    assignments2 = torch.tensor([0, 2, 4, 1])
+
+    prototypes1 = torch.nn.functional.normalize(torch.randn(5, 8), dim=-1)
+    prototypes2 = torch.nn.functional.normalize(torch.randn(6, 8), dim=-1)
+
+    phi1 = torch.full((5,), 0.2)
+    phi2 = torch.full((6,), 0.3)
+
+    model.set_clusterings(
+        [
+            (assignments1, prototypes1, phi1),
+            (assignments2, prototypes2, phi2),
+        ]
+    )
+
+    output = model(
+        torch.randn(2, 3, 8, 8),
+        torch.randn(2, 3, 8, 8),
+        indices=torch.tensor([0, 1]),
+    )
+
+    assert output.prototype_loss is not None
+    assert torch.isfinite(output.prototype_loss)
+    torch.testing.assert_close(
+        output.loss,
+        output.instance_loss + output.prototype_loss,
+    )
+
+    output.loss.backward()
+    assert any(p.grad is not None for p in model.backbone.student.parameters())
+
+
+@pytest.mark.unit
+def test_pcl_multiresolution_matches_mean_of_individual_losses():
+    """Multi-resolution ProtoNCE equals the mean of individual losses."""
+    import copy
+
+    torch.manual_seed(7)
+
+    base = make_model()
+    base.eval()  # Avoid queue updates during forward passes.
+    base.num_proto_negatives = 1
+
+    assignments1 = torch.tensor([0, 1, 2, 3])
+    assignments2 = torch.tensor([0, 2, 4, 1])
+
+    prototypes1 = torch.nn.functional.normalize(torch.randn(5, 8), dim=-1)
+    prototypes2 = torch.nn.functional.normalize(torch.randn(6, 8), dim=-1)
+
+    phi1 = torch.full((5,), 0.2)
+    phi2 = torch.full((6,), 0.3)
+
+    model1 = copy.deepcopy(base)
+    model2 = copy.deepcopy(base)
+    combined = copy.deepcopy(base)
+
+    model1.set_clustering(assignments1, prototypes1, phi1)
+    model2.set_clustering(assignments2, prototypes2, phi2)
+    combined.set_clusterings(
+        [
+            (assignments1, prototypes1, phi1),
+            (assignments2, prototypes2, phi2),
+        ]
+    )
+
+    view1 = torch.randn(2, 3, 8, 8)
+    view2 = torch.randn(2, 3, 8, 8)
+    indices = torch.tensor([0, 1])
+
+    torch.manual_seed(123)
+    out1 = model1(view1, view2, indices=indices)
+
+    torch.manual_seed(123)
+    out2 = model2(view1, view2, indices=indices)
+
+    torch.manual_seed(123)
+    out_combined = combined(view1, view2, indices=indices)
+
+    expected = (out1.prototype_loss + out2.prototype_loss) / 2
+
+    torch.testing.assert_close(
+        out_combined.prototype_loss,
+        expected,
+    )
+
+
+@pytest.mark.unit
+def test_pcl_clustering_state_dict_roundtrip():
+    """Check whether clustering state survives model serialization."""
+    import io
+
+    torch.manual_seed(7)
+    model = make_model()
+
+    assignments1 = torch.tensor([0, 1, 2, 3])
+    assignments2 = torch.tensor([0, 2, 4, 1])
+
+    prototypes1 = torch.nn.functional.normalize(torch.randn(5, 8), dim=-1)
+    prototypes2 = torch.nn.functional.normalize(torch.randn(6, 8), dim=-1)
+
+    phi1 = torch.full((5,), 0.2)
+    phi2 = torch.full((6,), 0.3)
+
+    model.set_clusterings(
+        [
+            (assignments1, prototypes1, phi1),
+            (assignments2, prototypes2, phi2),
+        ]
+    )
+
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)
+    buffer.seek(0)
+
+    restored = make_model()
+    state = torch.load(buffer, weights_only=True)
+
+    restored.load_state_dict(state, strict=True)
+
+    torch.testing.assert_close(
+        restored.cluster_assignments,
+        model.cluster_assignments,
+    )
+    torch.testing.assert_close(
+        restored.cluster_prototypes,
+        model.cluster_prototypes,
+    )
+    torch.testing.assert_close(
+        restored.cluster_concentrations,
+        model.cluster_concentrations,
+    )
+
+    assert len(restored.additional_clusterings) == 1
+    torch.testing.assert_close(
+        restored.additional_clusterings[0].prototypes,
+        model.additional_clusterings[0].prototypes,
+    )
