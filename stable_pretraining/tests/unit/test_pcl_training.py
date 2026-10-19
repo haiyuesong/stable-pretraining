@@ -7,7 +7,13 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from stable_pretraining.callbacks import TeacherStudentCallback
-from stable_pretraining.methods.pcl import PCL
+from stable_pretraining.methods.pcl import (
+    PCL,
+    extract_clustering_features,
+)
+from types import SimpleNamespace
+from stable_pretraining.methods.pcl import PCLClusteringCallback
+from lightning.pytorch.callbacks import Callback
 
 
 class TinyEncoder(nn.Module):
@@ -34,6 +40,7 @@ class TinyDataset(Dataset):
         image = torch.randn(3, 8, 8, generator=generator)
 
         return {
+            "image": image,
             "view1": image,
             "view2": image + 0.05,
             "indices": torch.tensor(index, dtype=torch.long),
@@ -103,3 +110,220 @@ def test_pcl_lightning_training_updates_ema(tmp_path):
     )
 
     assert model.queue.get().shape[0] == 16
+
+
+@pytest.mark.unit
+def test_extract_clustering_features_preserves_indices():
+    torch.manual_seed(7)
+
+    model = PCL(
+        encoder_name=TinyEncoder(),
+        projector_dims=(32, 8),
+        queue_length=16,
+    )
+    model.train()
+
+    dataloader = DataLoader(
+        TinyDataset(),
+        batch_size=4,
+        shuffle=True,
+        num_workers=0,
+    )
+
+    queue_before = model.queue.get().clone()
+
+    features = extract_clustering_features(model, dataloader)
+
+    assert features.shape == (16, 8)
+    assert torch.isfinite(features).all()
+
+    torch.testing.assert_close(
+        features.norm(dim=1),
+        torch.ones(16),
+    )
+
+    # Extractor must restore training state.
+    assert model.training
+
+    # Extractor must not modify the negative queue.
+    torch.testing.assert_close(
+        model.queue.get(),
+        queue_before,
+    )
+
+    # Verify index ordering against individual teacher outputs.
+    model.eval()
+    dataset = TinyDataset()
+
+    with torch.no_grad():
+        for idx in (0, 3, 9, 15):
+            image = dataset[idx]["image"].unsqueeze(0)
+
+            expected = model.projector.forward_teacher(
+                model.backbone.forward_teacher(image)
+            )
+            expected = torch.nn.functional.normalize(expected, dim=-1)
+
+            torch.testing.assert_close(
+                features[idx],
+                expected.squeeze(0),
+            )
+
+
+@pytest.mark.unit
+def test_pcl_clustering_callback_respects_warmup():
+    torch.manual_seed(7)
+
+    model = PCL(
+        encoder_name=TinyEncoder(),
+        projector_dims=(32, 8),
+        queue_length=16,
+    )
+
+    loader = DataLoader(
+        TinyDataset(),
+        batch_size=4,
+        shuffle=False,
+    )
+
+    callback = PCLClusteringCallback(
+        dataloader=loader,
+        num_clusters=3,
+        warmup_epochs=1,
+    )
+
+    trainer = SimpleNamespace(
+        current_epoch=0,
+        world_size=1,
+    )
+
+    # Epoch 0: warm-up, no clustering.
+    callback.on_train_epoch_start(trainer, model)
+
+    assert model.cluster_assignments.numel() == 0
+
+    # Epoch 1: clustering begins.
+    trainer.current_epoch = 1
+    callback.on_train_epoch_start(trainer, model)
+
+    assert model.cluster_assignments.shape == (16,)
+    assert model.cluster_prototypes.shape == (3, 8)
+    assert model.cluster_concentrations.shape == (3,)
+
+    assert torch.isfinite(model.cluster_concentrations).all()
+    assert (model.cluster_concentrations > 0).all()
+
+
+class PCLLossRecorder(Callback):
+    """Record PCL losses during Lightning training."""
+
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        self.records.append(
+            {
+                "epoch": trainer.current_epoch,
+                "instance_loss": outputs["instance_loss"].detach().cpu().item(),
+                "prototype_loss": (
+                    None
+                    if outputs.get("prototype_loss") is None
+                    else outputs["prototype_loss"].detach().cpu().item()
+                ),
+                "total_loss": outputs["loss"].detach().cpu().item(),
+            }
+        )
+
+
+@pytest.mark.unit
+def test_pcl_warmup_to_prototype_training(tmp_path):
+    """Run warm-up followed by prototype training with clustering refresh."""
+    torch.manual_seed(7)
+
+    model = PCL(
+        encoder_name=TinyEncoder(),
+        projector_dims=(32, 8),
+        queue_length=16,
+        temperature=0.2,
+    )
+    model.num_proto_negatives = 1
+    model.optim = {"optimizer": {"type": "SGD", "lr": 0.1}}
+
+    dataset = TinyDataset()
+
+    train_loader = DataLoader(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    clustering_loader = DataLoader(
+        dataset,
+        batch_size=4,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    clustering_callback = PCLClusteringCallback(
+        dataloader=clustering_loader,
+        num_clusters=8,
+        warmup_epochs=1,
+        refresh_every=1,
+        seed=7,
+    )
+
+    loss_recorder = PCLLossRecorder()
+
+    trainer = pl.Trainer(
+        max_epochs=2,
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        callbacks=[
+            TeacherStudentCallback(verbose=False),
+            clustering_callback,
+            loss_recorder,
+        ],
+        default_root_dir=tmp_path,
+    )
+
+    trainer.fit(model, train_dataloaders=train_loader)
+
+    # Two epochs, eight batches per epoch.
+    assert trainer.global_step == 16
+
+    # Clustering must have started after warm-up.
+    assert model.cluster_assignments.shape == (16,)
+    assert model.cluster_prototypes.shape == (8, 8)
+    assert model.cluster_concentrations.shape == (8,)
+
+    # Prototype temperatures must remain positive.
+    assert torch.isfinite(model.cluster_concentrations).all()
+    assert (model.cluster_concentrations > 0).all()
+
+    warmup_records = [r for r in loss_recorder.records if r["epoch"] == 0]
+    prototype_records = [r for r in loss_recorder.records if r["epoch"] == 1]
+
+    assert len(warmup_records) == 8
+    assert len(prototype_records) == 8
+
+    # Warm-up: instance-only training.
+    for record in warmup_records:
+        assert record["prototype_loss"] is None
+        assert torch.isfinite(torch.tensor(record["instance_loss"]))
+        assert record["total_loss"] == pytest.approx(record["instance_loss"])
+
+    # After clustering: both objectives must contribute.
+    for record in prototype_records:
+        assert record["prototype_loss"] is not None
+        assert torch.isfinite(torch.tensor(record["prototype_loss"]))
+        assert record["total_loss"] == pytest.approx(
+            record["instance_loss"] + record["prototype_loss"],
+            rel=1e-5,
+            abs=1e-6,
+        )

@@ -11,12 +11,15 @@ from typing import Optional, Sequence, Union
 
 import torch.nn as nn
 from transformers.utils import ModelOutput
+from torch.utils.data import DataLoader
 
 from stable_pretraining import Module
 from stable_pretraining.backbone import TeacherStudentWrapper, from_timm
 from stable_pretraining.callbacks.queues import UnsortedQueue
 
 from stable_pretraining.losses.pcl import ProtoNCELoss, select_prototypes
+
+from lightning.pytorch.callbacks import Callback
 
 
 @torch.no_grad()
@@ -202,6 +205,63 @@ def estimate_concentrations(
 
     phi = temperature * phi / phi.mean()
     return phi
+
+
+@torch.no_grad()
+def extract_clustering_features(
+    model: "PCL",
+    dataloader: DataLoader,
+) -> torch.Tensor:
+    """Extract one momentum-encoder representation per dataset sample.
+
+    The dataloader must provide:
+        image: Tensor [B, C, H, W]
+        indices: Unique dataset indices [B]
+
+    Returns:
+        L2-normalized representations [N, D], ordered by index.
+    """
+    num_samples = len(dataloader.dataset)
+    output_dim = model.cluster_prototypes.shape[1]
+    device = next(model.parameters()).device
+
+    features = torch.empty(num_samples, output_dim, device=device)
+    visited = torch.zeros(num_samples, dtype=torch.bool, device=device)
+
+    was_training = model.training
+
+    try:
+        model.eval()
+
+        for batch in dataloader:
+            images = batch["image"].to(device)
+            indices = batch["indices"].to(device=device, dtype=torch.long)
+
+            if indices.ndim != 1:
+                raise ValueError("indices must have shape [B]")
+            if indices.numel() != images.shape[0]:
+                raise ValueError("indices and images batch sizes differ")
+            if not torch.all((indices >= 0) & (indices < num_samples)).item():
+                raise ValueError("Dataset index out of range")
+            if torch.unique(indices).numel() != indices.numel():
+                raise ValueError("Duplicate dataset indices in batch")
+            if visited[indices].any().item():
+                raise ValueError("Dataset index visited more than once")
+
+            embeddings = model.backbone.forward_teacher(images)
+            projections = model.projector.forward_teacher(embeddings)
+            projections = F.normalize(projections, dim=-1)
+
+            features[indices] = projections
+            visited[indices] = True
+
+        if not visited.all().item():
+            raise ValueError("Feature extraction did not visit every dataset sample")
+
+        return features
+
+    finally:
+        model.train(was_training)
 
 
 @dataclass
@@ -485,4 +545,67 @@ class PCL(Module):
             view1=view1,
             view2=view2,
             indices=indices,
+        )
+
+
+class PCLClusteringCallback(Callback):
+    """Refresh PCL clustering at configured epoch boundaries.
+
+    Initial implementation supports single-process training.
+    """
+
+    def __init__(
+        self,
+        dataloader: DataLoader,
+        num_clusters: int,
+        warmup_epochs: int = 1,
+        refresh_every: int = 1,
+        num_iterations: int = 20,
+        seed: int = 0,
+    ):
+        super().__init__()
+
+        if warmup_epochs < 0:
+            raise ValueError("warmup_epochs must be nonnegative")
+        if refresh_every < 1:
+            raise ValueError("refresh_every must be positive")
+
+        self.dataloader = dataloader
+        self.num_clusters = num_clusters
+        self.warmup_epochs = warmup_epochs
+        self.refresh_every = refresh_every
+        self.num_iterations = num_iterations
+        self.seed = seed
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        epoch = trainer.current_epoch
+
+        if epoch < self.warmup_epochs:
+            return
+
+        if (epoch - self.warmup_epochs) % self.refresh_every != 0:
+            return
+
+        if trainer.world_size != 1:
+            raise RuntimeError(
+                "Distributed PCL clustering refresh is not yet supported"
+            )
+
+        features = extract_clustering_features(
+            pl_module,
+            self.dataloader,
+        )
+
+        assignments, prototypes, concentrations = kmeans(
+            features,
+            num_clusters=self.num_clusters,
+            num_iterations=self.num_iterations,
+            seed=self.seed + epoch,
+            temperature=pl_module.temperature,
+        )
+
+        pl_module.set_clustering(
+            assignments,
+            prototypes,
+            concentrations,
         )
