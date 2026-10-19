@@ -416,3 +416,41 @@ def test_pcl_clustering_state_dict_roundtrip():
         restored.additional_clusterings[0].prototypes,
         model.additional_clusterings[0].prototypes,
     )
+
+
+@pytest.mark.unit
+def test_pcl_queue_excludes_current_batch_keys():
+    """Current keys must not be used as their own negatives."""
+    torch.manual_seed(7)
+    model = make_model()
+    model.train()
+
+    # Queue starts empty.
+    assert model.queue.get().shape[0] == 0
+
+    view1 = torch.randn(4, 3, 8, 8)
+    view2 = torch.randn(4, 3, 8, 8)
+
+    first = model(view1, view2)
+
+    # No previous negatives: first loss is zero.
+    torch.testing.assert_close(
+        first.instance_loss,
+        torch.zeros_like(first.instance_loss),
+    )
+
+    # Current keys are added only after computing the loss.
+    assert model.queue.get().shape[0] == 4
+    torch.testing.assert_close(
+        model.queue.get(),
+        first.keys,
+    )
+
+    # Second batch can use the stored keys as negatives.
+    second = model(
+        torch.randn(4, 3, 8, 8),
+        torch.randn(4, 3, 8, 8),
+    )
+
+    assert second.instance_loss.item() > 0
+    assert model.queue.get().shape[0] == 8
