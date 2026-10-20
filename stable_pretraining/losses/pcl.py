@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 class ProtoNCELoss(nn.Module):
-    """ProtoNCE with explicitly selected negative prototypes."""
+    """ProtoNCE using batch positives and sampled negative prototypes."""
 
     def forward(
         self,
@@ -16,36 +16,35 @@ class ProtoNCELoss(nn.Module):
         positive_concentrations: torch.Tensor,
         negative_concentrations: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute the prototype contrastive objective.
+        """Compute ProtoNCE with B + R candidate prototype entries."""
+        batch_size, dim = queries.shape
 
-        Shapes:
-            queries: [B, D]
-            positive_prototypes: [B, D]
-            negative_prototypes: [K, D]
-            positive_concentrations: [B]
-            negative_concentrations: [K]
-        """
-        if not (
-            torch.all(positive_concentrations > 0)
-            and torch.all(negative_concentrations > 0)
-        ):
-            raise ValueError("Concentrations must be positive.")
+        if positive_prototypes.shape != (batch_size, dim):
+            raise ValueError("Invalid positive prototype shape")
+        if negative_prototypes.ndim != 2 or negative_prototypes.shape[1] != dim:
+            raise ValueError("Invalid negative prototype shape")
+        if positive_concentrations.shape != (batch_size,):
+            raise ValueError("Invalid positive concentration shape")
+        if negative_concentrations.shape != (negative_prototypes.shape[0],):
+            raise ValueError("Invalid negative concentration shape")
 
-        positive_logits = (queries * positive_prototypes).sum(
-            dim=-1, keepdim=True
-        ) / positive_concentrations[:, None]
-
-        negative_logits = (queries @ negative_prototypes.T) / negative_concentrations[
-            None, :
-        ]
-
-        logits = torch.cat([positive_logits, negative_logits], dim=1)
-
-        targets = torch.zeros(
-            queries.size(0),
-            dtype=torch.long,
-            device=queries.device,
+        temperatures = torch.cat(
+            [positive_concentrations, negative_concentrations],
+            dim=0,
         )
+        if not torch.isfinite(temperatures).all().item():
+            raise ValueError("Concentrations must be finite")
+        if not (temperatures > 0).all().item():
+            raise ValueError("Concentrations must be positive")
+
+        candidates = torch.cat(
+            [positive_prototypes, negative_prototypes],
+            dim=0,
+        )
+
+        logits = (queries @ candidates.T) / temperatures.unsqueeze(0)
+
+        targets = torch.arange(batch_size, device=queries.device)
 
         return F.cross_entropy(logits, targets)
 

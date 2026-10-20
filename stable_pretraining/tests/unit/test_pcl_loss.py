@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-
+import torch.nn.functional as F
 from stable_pretraining.losses.pcl import (
     ProtoNCELoss,
     select_prototypes,
@@ -118,3 +118,46 @@ def test_select_prototypes_insufficient_negatives():
             concentrations,
             num_negatives=1,
         )
+
+
+def test_protonce_uses_all_batch_positive_prototypes():
+    queries = F.normalize(
+        torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        dim=1,
+    )
+    positives = queries.clone()
+    negatives = torch.tensor([[-1.0, 0.0]])
+
+    loss_fn = ProtoNCELoss()
+
+    actual = loss_fn(
+        queries=queries,
+        positive_prototypes=positives,
+        negative_prototypes=negatives,
+        positive_concentrations=torch.ones(2),
+        negative_concentrations=torch.ones(1),
+    )
+
+    # Both positives are included in every query's denominator.
+    candidates = torch.cat([positives, negatives], dim=0)
+    expected = F.cross_entropy(
+        queries @ candidates.T,
+        torch.arange(2),
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+    # The old implementation omits other samples' positives.
+    old_logits = torch.cat(
+        [
+            (queries * positives).sum(dim=1, keepdim=True),
+            queries @ negatives.T,
+        ],
+        dim=1,
+    )
+    old_loss = F.cross_entropy(
+        old_logits,
+        torch.zeros(2, dtype=torch.long),
+    )
+
+    assert not torch.isclose(actual, old_loss)
