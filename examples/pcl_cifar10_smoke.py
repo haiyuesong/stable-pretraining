@@ -1,5 +1,7 @@
 """Small CIFAR-10 smoke experiment for PCL."""
 
+import os
+
 import lightning as pl
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -99,7 +101,7 @@ def main():
 
     trainer = pl.Trainer(
         max_epochs=2,
-        accelerator="cpu",
+        accelerator=os.environ.get("PCL_ACCELERATOR", "cpu"),
         devices=1,
         logger=False,
         enable_checkpointing=False,
