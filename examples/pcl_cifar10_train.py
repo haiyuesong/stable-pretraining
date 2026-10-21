@@ -141,6 +141,11 @@ def parse_args():
         default=None,
         help="Path to a trusted Lightning checkpoint.",
     )
+    parser.add_argument(
+        "--backbone",
+        choices=["resnet18", "resnet50"],
+        default="resnet18",
+    )
 
     return parser.parse_args()
 
@@ -178,7 +183,7 @@ def main():
     )
 
     model = PCL(
-        encoder_name="resnet18",
+        encoder_name=args.backbone,
         low_resolution=True,
         projector_dims=(512, 128),
         queue_length=args.queue_length,
@@ -190,6 +195,8 @@ def main():
         "optimizer": {
             "type": "SGD",
             "lr": args.learning_rate,
+            "momentum": 0.9,
+            "weight_decay": 1e-4,
         }
     }
 

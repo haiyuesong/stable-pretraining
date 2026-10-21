@@ -72,6 +72,16 @@ def main():
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--k", type=int, default=20)
     parser.add_argument("--random-baseline", action="store_true")
+    parser.add_argument(
+        "--backbone",
+        choices=["resnet18", "resnet50"],
+        default="resnet18",
+    )
+    parser.add_argument(
+        "--queue-length",
+        type=int,
+        default=256,
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -113,10 +123,10 @@ def main():
     )
 
     model = PCL(
-        encoder_name="resnet18",
+        encoder_name=args.backbone,
         low_resolution=True,
         projector_dims=(512, 128),
-        queue_length=256,
+        queue_length=args.queue_length,
         temperature=0.2,
     )
 
